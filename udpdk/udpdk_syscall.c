@@ -8,6 +8,7 @@
 
 #include <rte_log.h>
 #include <rte_random.h>
+#include <rte_cycles.h>
 
 #include "udpdk_api.h"
 #include "udpdk_bind_table.h"
@@ -367,6 +368,68 @@ ssize_t udpdk_sendto(int sockfd, const void *buf, size_t len, int flags,
     return len;
 }
 
+static int poll_in_one_validate_args(int sockfd) {
+    // Ensure sockfd is not beyond max limit
+    if (sockfd >= NUM_SOCKETS_MAX) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+
+    // Check if the sockfd is valid
+    if (!exch_zone_desc->slots[sockfd].used) {
+        errno = EBADF;
+        return -1;
+    }
+    return 0;
+}
+
+int udpdk_poll_in_one(int sockfd, int timeout) {
+    struct rte_ring *rx_q;
+    uint64_t start_cycles = 0;
+    uint64_t timeout_cycles = 0;
+
+    // Validate args
+    if (poll_in_one_validate_args(sockfd) < 0) {
+        return -1;
+    }
+
+    rx_q = exch_slots[sockfd].rx_q;
+
+    // Check immediately
+    if (!rte_ring_empty(rx_q)) {
+        return 1;
+    }
+
+    if (timeout == 0) {
+        return 0;
+    }
+
+    // Setup timer for finite timeout
+    if (timeout > 0) {
+        start_cycles = rte_get_timer_cycles();
+        timeout_cycles = (uint64_t)timeout * (rte_get_timer_hz() / 1000);
+    }
+
+    while (!interrupted) {
+        // Check Data
+        if (!rte_ring_empty(rx_q)) {
+            return 1;
+        }
+
+        // Check Time
+        if (timeout > 0) {
+            if ((rte_get_timer_cycles() - start_cycles) >= timeout_cycles) {
+                return 0;
+            }
+        }
+
+        rte_pause();
+    }
+
+    errno = EINTR;
+    return -1;
+}
+
 static int recvfrom_validate_args(int sockfd, void *buf, size_t len, int flags,
                                   struct sockaddr *src_addr, socklen_t *addrlen)
 {
@@ -384,8 +447,8 @@ static int recvfrom_validate_args(int sockfd, void *buf, size_t len, int flags,
 
     // TODO check if buf is a legit address
 
-    // Check if flags are supported (atm none is supported)
-    if (flags != 0) {
+    // Check if flags are supported (atm only MSG_DONTWAIT is supported)
+    if (flags != 0 && !(flags & MSG_DONTWAIT)) {
         errno = EINVAL;
         return -1;
     }
@@ -420,9 +483,17 @@ ssize_t udpdk_recvfrom(int sockfd, void *buf, size_t len, int flags,
         return -1;
     }
 
-    // Dequeue one packet (busy wait until one is available)
+    // Dequeue one packet (busy wait until one is available or
+    // return early if it would block and MSG_DONTWAIT is set)
     while (ret < 0 && !interrupted) {
         ret = rte_ring_dequeue(exch_slots[sockfd].rx_q, (void **)&pkt);
+        if (ret < 0) {
+            if (flags & MSG_DONTWAIT) {
+                errno = EWOULDBLOCK;
+                return -1;
+            }
+            rte_pause();
+        }
     }
     if (interrupted) {
         RTE_LOG(INFO, SYSCALL, "Recvfrom returning due to signal\n");

@@ -35,6 +35,8 @@ int udpdk_bind(int s, const struct sockaddr *addr, socklen_t addrlen);
 ssize_t udpdk_sendto(int sockfd, const void *buf, size_t len, int flags,
         const struct sockaddr *dest_addr, socklen_t addrlen);
 
+int udpdk_poll_in_one(int sockfd, int timeout);
+
 ssize_t udpdk_recvfrom(int s, void *buf, size_t len, int flags,
         struct sockaddr *src_addr, socklen_t *addrlen);
 
